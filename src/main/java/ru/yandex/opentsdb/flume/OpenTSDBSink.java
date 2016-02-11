@@ -1,0 +1,497 @@
+package ru.yandex.opentsdb.flume;
+
+import com.google.common.base.Throwables;
+import com.stumbleupon.async.Callback;
+import com.stumbleupon.async.Deferred;
+import com.yammer.metrics.core.Gauge;
+import com.yammer.metrics.core.Meter;
+import com.yammer.metrics.core.MetricsRegistry;
+import net.opentsdb.core.TSDB;
+import net.opentsdb.core.Tags;
+import net.opentsdb.core.WritableDataPoints;
+import net.opentsdb.utils.Config;
+import org.apache.flume.Channel;
+import org.apache.flume.Context;
+import org.apache.flume.Event;
+import org.apache.flume.EventDeliveryException;
+import org.apache.flume.Transaction;
+import org.apache.flume.conf.Configurable;
+import org.apache.flume.instrumentation.ChannelCounter;
+import org.apache.flume.instrumentation.SinkCounter;
+import org.apache.flume.lifecycle.LifecycleState;
+import org.apache.flume.sink.AbstractSink;
+import org.hbase.async.HBaseClient;
+import org.hbase.async.HBaseRpc;
+import org.hbase.async.PleaseThrottleException;
+import org.hbase.async.PutRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Sink, capable to do writes into opentsdb.
+ * This version expects full command in event body.
+ *
+ * @author Andrey Stepachev
+ */
+public class OpenTSDBSink extends AbstractSink implements Configurable {
+
+  private final Logger logger = LoggerFactory.getLogger(OpenTSDBSink.class);
+  public static final Charset UTF8 = Charset.forName("UTF-8");
+
+  private SinkCounter sinkCounter;
+  private ChannelCounter channelCounter;
+  private int batchSize;
+
+  private TSDB tsdb;
+  private HBaseClient hbaseClient;
+  private String zkquorum;
+  private String zkpath;
+  private String seriesTable;
+  private String uidsTable;
+  private int parallel;
+  private Meter pointsCounter;
+
+  /**
+   * State object holds result of asynchronous operations.
+   * Implements throttle, when hbase can't handle incoming
+   * rate of data points.
+   * This object should be added as callback to handle throttles.
+   */
+  private class State implements Callback<Object, Exception> {
+    volatile boolean throttle = false;
+    volatile Exception failure;
+    private AtomicInteger inFlight = new AtomicInteger(0);
+    private Semaphore signal = new Semaphore(0);
+
+    public Object call(final Exception arg) {
+      if (arg instanceof PleaseThrottleException) {
+        final PleaseThrottleException e = (PleaseThrottleException) arg;
+        logger.warn("Need to throttle, HBase isn't keeping up.", e);
+        throttle = true;
+        final HBaseRpc rpc = e.getFailedRpc();
+        if (rpc instanceof PutRequest) {
+          hbaseClient.put((PutRequest) rpc);  // Don't lose edits.
+        }
+        return null;
+      }
+      failure = arg;
+      return arg;
+    }
+
+    /**
+     * Main entry method for adding points
+     *
+     * @param data points list
+     */
+    private void writeDataPoints(List<EventData> data) throws Exception {
+      if (data.size() < 1)
+        return;
+      final WritableDataPoints dataPoints = tsdb.newDataPoints();
+      final EventData first = data.get(0);
+      dataPoints.setSeries(first.metric, first.tags);
+      dataPoints.setBatchImport(false); // we need data to be persisted
+      long prevTs = 0;
+      Set<String> failures = new HashSet<String>();
+      for (EventData eventData : data) {
+        try {
+          if (eventData.timestamp == prevTs)
+            continue;
+          sinkCounter.incrementEventDrainAttemptCount();
+          prevTs = eventData.timestamp;
+          final Deferred<Object> d =
+                  eventData.makeDeferred(dataPoints, this);
+          d.addCallback(new Callback<Object, Object>() {
+            @Override
+            public Object call(Object o) throws Exception {
+              pointsCounter.mark();
+              inFlight.decrementAndGet();
+              signal.release();
+              return null;
+            }
+          });
+          d.addErrback(this);
+          if (throttle)
+            throttle(d);
+          inFlight.incrementAndGet();
+          sinkCounter.incrementEventDrainSuccessCount();
+        } catch (IllegalArgumentException ie) {
+          failures.add(ie.getMessage());
+        }
+      }
+      if (failures.size() > 0) {
+        logger.error("Points imported with " + failures.toString() + " IllegalArgumentExceptions");
+      }
+    }
+
+    /**
+     * Wait for all deferries are complete
+     *
+     * @throws Exception
+     */
+    private void join() throws Exception {
+      while (inFlight.get() != 0) {
+        signal.acquire();
+        int complete = signal.drainPermits();
+      }
+    }
+
+    /**
+     * Helper method, implements throttle.
+     * Sleeps, until throttle will be switch off
+     * by successful operation.
+     *
+     * @param deferred
+     */
+    private void throttle(Deferred deferred) {
+      logger.info("Throttling...");
+      long throttle_time = System.nanoTime();
+      try {
+        deferred.join();
+      } catch (Exception e) {
+        throw new RuntimeException("Should never happen", e);
+      }
+      throttle_time = System.nanoTime() - throttle_time;
+      if (throttle_time < 1000000000L) {
+        logger.info("Got throttled for only " + throttle_time + "ns, sleeping a bit now");
+        try {
+          Thread.sleep(1000);
+        } catch (InterruptedException e) {
+          throw new RuntimeException("interrupted", e);
+        }
+      }
+      logger.info("Done throttling...");
+      throttle = false;
+    }
+  }
+
+  /**
+   * Parsed event.
+   */
+  private static class EventData {
+
+    final String seriesKey;
+    final String metric;
+    final long timestamp;
+    final String value;
+    final HashMap<String, String> tags;
+
+    public EventData(String seriesKey, String metric, long timestamp, String value, HashMap<String, String> tags) {
+      this.seriesKey = seriesKey;
+      this.metric = metric.replace('@', '_'); // FIXME: Workaround for opentsdb regarding the '@' symbol as invalid
+      this.timestamp = timestamp;
+      this.value = value;
+      this.tags = tags;
+    }
+
+    public Deferred<Object> makeDeferred(WritableDataPoints dp, State state) {
+      Deferred<Object> d;
+      if (Tags.looksLikeInteger(value)) {
+        d = dp.addPoint(timestamp, Tags.parseLong(value));
+      } else {  // floating point value
+        d = dp.addPoint(timestamp, Float.parseFloat(value));
+      }
+      return d;
+    }
+
+    static Comparator<EventData> orderBySeriesAndTimestamp() {
+      return new Comparator<EventData>() {
+        public int compare(EventData o1, EventData o2) {
+          int c = o1.seriesKey.compareTo(o2.seriesKey);
+          if (c == 0)
+            return (o1.timestamp < o2.timestamp) ? -1 : (o1.timestamp == o2.timestamp ? 0 : 1);
+          else
+            return c;
+        }
+      };
+    }
+
+    static Comparator<EventData> orderByTimestamp() {
+      return new Comparator<EventData>() {
+        public int compare(EventData o1, EventData o2) {
+          return (o1.timestamp < o2.timestamp) ? -1 : (o1.timestamp == o2.timestamp ? 0 : 1);
+        }
+      };
+    }
+
+    @Override
+    public String toString() {
+      return "EventData{" +
+              "seriesKey='" + seriesKey + '\'' +
+              ", metric='" + metric + '\'' +
+              ", timestamp=" + timestamp +
+              ", value='" + value + '\'' +
+              ", tags=" + tags +
+              '}';
+    }
+  }
+
+
+  /**
+   * EventData 'constructor'
+   *
+   * @param event what to parse
+   * @return constructed EventData
+   */
+  private EventData parseEvent(final byte[] body) {
+    final int idx = eventBodyStart(body);
+    if (idx == -1) {
+      logger.error("empty event");
+      return null;
+    }
+    final String[] words = Tags.splitString(
+            new String(body, idx, body.length - idx, UTF8), ' ');
+    final String metric = words[0];
+    if (metric.length() <= 0) {
+      logger.error("invalid metric: " + metric);
+      return null;
+    }
+    final long timestamp = Tags.parseLong(words[1]);
+    if (timestamp <= 0) {
+      logger.error("invalid metric: " + metric);
+      return null;
+    }
+    final String value = words[2];
+    if (value.length() <= 0) {
+      logger.error("invalid value: " + value);
+      return null;
+    }
+    final String[] tagWords = Arrays.copyOfRange(words, 3, words.length);
+    // keep them sorted, helps to identify tags in different order, but
+    // same set of them
+    Arrays.sort(tagWords);
+    final HashMap<String, String> tags = new HashMap<String, String>();
+    StringBuilder seriesKey = new StringBuilder(metric);
+    for (String tagWord : tagWords) {
+      if (!tagWord.isEmpty()) {
+        Tags.parse(tags, tagWord);
+        seriesKey.append(' ').append(tagWord);
+      }
+    }
+    return new EventData(seriesKey.toString(), metric, timestamp, value, tags);
+  }
+
+  /**
+   * Process event, spawns up to 'parallel' number of executors,
+   * and concurrently take transactions and send
+   * to hbase.
+   *
+   * @return Status
+   * @throws EventDeliveryException
+   */
+  @Override
+  public Status process() throws EventDeliveryException {
+    final Channel channel = getChannel();
+    final BlockingQueue<Integer> next = new ArrayBlockingQueue<Integer>(parallel + 1);
+    final List<Future<Long>> futures = new ArrayList<Future<Long>>();
+    final Callable<Long> worker = worker(channel, next);
+    final ExecutorService service = Executors.newFixedThreadPool(parallel);
+
+    try {
+      futures.add(service.submit(worker));
+      while (futures.size() > 0) {
+        try {
+          Integer handled;
+          while ((handled = next.poll(100, TimeUnit.MILLISECONDS)) != null) {
+            if (handled > batchSize / 2
+                    && futures.size() < parallel
+                    && !getLifecycleState().equals(LifecycleState.STOP)) {
+              futures.add(service.submit(worker));
+              futures.add(service.submit(worker));
+              logger.info("Additional worker spawned: threads=" + futures.size() + ", processed=" + handled);
+            }
+          }
+          final Iterator<Future<Long>> it = futures.iterator();
+          while (it.hasNext()) {
+            Future<Long> future = it.next();
+            if (future.isDone()) {
+              try {
+                future.get();
+              } catch (ExecutionException e) {
+                logger.error("Worker failed: ", e.getCause());
+              }
+              it.remove();
+            }
+          }
+        } catch (InterruptedException e) {
+          service.shutdown();
+        }
+      }
+      return Status.READY;
+    } finally {
+      service.shutdownNow();
+    }
+  }
+
+  /**
+   * Workhorse. Gets transaction, parses, sends to hbase storage.
+   *
+   * @param channel from where transactions are get
+   * @param next
+   * @return callable
+   */
+  private Callable<Long> worker(final Channel channel, final BlockingQueue<Integer> next) {
+    return new Callable<Long>() {
+      @Override
+      public Long call() throws Exception {
+
+        long total = 0;
+        ArrayList<EventData> datas = new ArrayList<EventData>(batchSize);
+        final State state = new State();
+        Transaction transaction = channel.getTransaction();
+        Event event;
+        try {
+          transaction.begin();
+          long stime = System.currentTimeMillis();
+          while ((event = channel.take()) != null && datas.size() < batchSize) {
+            if (state.failure != null)
+              throw Throwables.propagate(state.failure);
+
+            try {
+              BatchEvent be = new BatchEvent(event.getBody());
+              for (byte[] body : be) {
+                final EventData eventData = parseEvent(body);
+                if (eventData == null)
+                  continue;
+
+                datas.add(eventData);
+              }
+            } catch (Exception e) {
+              continue;
+            }
+          }
+          final int size = datas.size();
+          next.put(size);
+          total += size;
+          channelCounter.addToEventTakeSuccessCount(size);
+          if (size == 1) {
+            state.writeDataPoints(datas);
+          } else if (size > 0) {
+            stime = System.currentTimeMillis();
+            // sort incoming datapoints, tsdb doesn't like unordered
+            Collections.sort(datas, EventData.orderBySeriesAndTimestamp());
+            int start = 0;
+            String seriesKey = datas.get(0).seriesKey;
+            for (int end = 1; end < size; end++) {
+              if (!seriesKey.equals(datas.get(end).seriesKey)) {
+                state.writeDataPoints(datas.subList(start, end));
+                start = end;
+              }
+            }
+            state.writeDataPoints(datas.subList(start, size));
+
+          }
+          if (size > 0) {
+            logger.info("Ready to wait for " + size + " events, prepared in " + (System.currentTimeMillis() - stime) + "ms");
+            // and wait, until all our inflight deferred will complete
+            state.join();
+            sinkCounter.incrementBatchCompleteCount();
+            if (size < batchSize)
+              sinkCounter.incrementBatchUnderflowCount();
+            channelCounter.addToEventPutSuccessCount(size);
+            logger.info("Batch written with " + size + " events in " + (System.currentTimeMillis() - stime) + "ms");
+          }
+          transaction.commit();
+        } catch (Throwable t) {
+          logger.error("Batch failed: number of events " + datas.size(), t);
+          transaction.rollback();
+          throw Throwables.propagate(t);
+        } finally {
+          transaction.close();
+        }
+        return total;
+      }
+    };
+  }
+
+  private byte[] PUT = {'p', 'u', 't'};
+
+  public int eventBodyStart(final byte[] body) {
+    int idx = 0;
+    for (byte b : PUT) {
+      if (body[idx++] != b)
+        return -1;
+    }
+    while (idx < body.length) {
+      if (body[idx] != ' ') {
+        return idx;
+      }
+      idx++;
+    }
+    return -1;
+  }
+
+
+  @Override
+  public void configure(Context context) {
+    sinkCounter = new SinkCounter(getName());
+    channelCounter = new ChannelCounter(getName());
+
+    batchSize = context.getInteger("batchSize", 100);
+    zkquorum = context.getString("zkquorum");
+    zkpath = context.getString("zkpath", "/hbase");
+    seriesTable = context.getString("table.main", "tsdb");
+    uidsTable = context.getString("table.uids", "tsdb-uid");
+    parallel = context.getInteger("parallel", Runtime.getRuntime().availableProcessors() / 2 + 1);
+    pointsCounter = Metrics.registry.newMeter(this.getClass(), "write", "points", TimeUnit.SECONDS);
+  }
+
+  @Override
+  public synchronized void start() {
+    logger.info(String.format("Starting: %s:%s series:%s uids:%s batchSize:%d",
+            zkquorum, zkpath, seriesTable, uidsTable, batchSize));
+    hbaseClient = new HBaseClient(zkquorum, zkpath);
+    try {
+        Config config = new Config(false);
+        config.overrideConfig("tsd.storage.hbase.data_table", "tsdb");
+        config.overrideConfig("tsd.storage.hbase.uid_table", "tsdb-uid");
+        config.overrideConfig("tsd.core.auto_create_metrics", "true");
+        config.overrideConfig("tsd.storage.enable_compaction", "false");
+
+        tsdb = new TSDB(hbaseClient, config);
+    } catch (IOException e) {
+        logger.error("tsdb initialization fail: ", e);
+    }
+    channelCounter.start();
+    sinkCounter.start();
+    super.start();
+  }
+
+  @Override
+  public synchronized void stop() {
+    if (tsdb != null)
+      try {
+        tsdb.shutdown().joinUninterruptibly();
+        tsdb = null;
+        hbaseClient = null;
+      } catch (Exception e) {
+        logger.error("Can't shutdown tsdb", e);
+        throw Throwables.propagate(e);
+      }
+    channelCounter.stop();
+    sinkCounter.stop();
+    super.stop();
+  }
+}
