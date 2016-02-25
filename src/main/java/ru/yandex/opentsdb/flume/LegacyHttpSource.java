@@ -69,8 +69,6 @@ import java.util.concurrent.TimeUnit;
  *        ...
  *   }
  * </pre>
- *
- * @author Andrey Stepachev
  */
 public class LegacyHttpSource extends AbstractLineEventSource {
 

@@ -19,9 +19,6 @@ import java.util.Map;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
-/**
- * @author Andrey Stepachev
- */
 public class BatchEvent implements Event, Iterable<byte[]> {
 
   private static final Map<String, String> EMPTY_MAP =

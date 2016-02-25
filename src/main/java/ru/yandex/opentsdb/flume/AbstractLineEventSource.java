@@ -21,9 +21,6 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-/**
- * @author Andrey Stepachev
- */
 public class AbstractLineEventSource
         extends AbstractSource
         implements EventDrivenSource, Configurable {

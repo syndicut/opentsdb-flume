@@ -53,8 +53,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Sink, capable to do writes into opentsdb.
  * This version expects full command in event body.
- *
- * @author Andrey Stepachev
  */
 public class OpenTSDBSink extends AbstractSink implements Configurable {
 

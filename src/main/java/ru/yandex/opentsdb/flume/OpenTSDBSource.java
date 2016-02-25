@@ -22,9 +22,6 @@ import java.net.InetSocketAddress;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-/**
- * @author Andrey Stepachev
- */
 public class OpenTSDBSource extends AbstractLineEventSource {
 
   private static final Logger logger = LoggerFactory
