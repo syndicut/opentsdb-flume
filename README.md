@@ -44,3 +44,12 @@ tsdbflume.sinks.sink1.zkpath = /zk_base_name/hbase
 tsdbflume.sinks.sink1.channel = channel1
 
 ```
+
+test it:
+
+```bash
+for i in {1..1000};
+do
+    echo "put sys.cpu.user2233 144764916${i} 50.5 host=webserver01 cpu=0" | nc -vv localhost 4444
+done
+```
