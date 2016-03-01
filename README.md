@@ -15,6 +15,26 @@ opentsdb into local repo directory
 Config example:
 ============
 ```ini
+tsdbflume.sources = source1
+tsdbflume.sinks = sink1 sink2 sink3 sink4 sink5 sink6 sink7 sink8.
+tsdbflume.sinkgroups.g1.sinks = sink1 sink2 sink3 sink4 sink5 sink6 sink7 sink8 sink9.
+tsdbflume.sinkgroups.g1.processor.type = load_balance
+tsdbflume.channels = channel1
+
+# Describe/configure source1
+tsdbflume.sources.source1.type = ru.yandex.opentsdb.flume.OpenTSDBSource
+tsdbflume.sources.source1.port = 4444
+
+tsdbflume.sources.source1.batchSize = 2000
+tsdbflume.sources.source1.channels = channel1
+
+tsdbflume.channels.channel1.type = FILE
+tsdbflume.channels.channel1.checkpointDir = /srv/hd1/opentsdb/flume/checkpoint
+tsdbflume.channels.channel1.dataDirs = /srv/hd1//opentsdb/flume/data,/srv/hd2//opentsdb/flume/data
+tsdbflume.channels.channel1.transactionCapacity = 200000
+tsdbflume.channels.channel1.checkpointInterval = 2000
+tsdbflume.channels.channel1.maxFileSize = 2146435071
+tsdbflume.channels.channel1.capacity = 1000000
 
 tsdbflume.sinks.sink1.type = ru.yandex.opentsdb.flume.OpenTSDBSink2
 tsdbflume.sinks.sink1.batchSize = 6000
