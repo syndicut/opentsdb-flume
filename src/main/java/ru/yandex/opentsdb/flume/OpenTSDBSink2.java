@@ -408,7 +408,7 @@ public class OpenTSDBSink2 extends AbstractSink implements Configurable {
             zkquorum, zkpath, seriesTable, uidsTable, batchSize));
     hbaseClient = new HBaseClient(zkquorum, zkpath);
     try {
-        Config config = new Config(false);
+        Config config = new Config(true);
         config.overrideConfig("tsd.storage.hbase.data_table", "tsdb");
         config.overrideConfig("tsd.storage.hbase.uid_table", "tsdb-uid");
         config.overrideConfig("tsd.core.auto_create_metrics", "true");
